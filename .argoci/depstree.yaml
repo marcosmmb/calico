@@ -611,8 +611,8 @@ components:
       - ^pkg/buildinfo/[^/]*\.go$
       - ^pkg/cmdwrapper/[^/]*\.go$
       - ^pod2daemon/binder/[^/]*\.go$
+      - ^pod2daemon/csidriver/creds/[^/]*\.go$
       - ^pod2daemon/csidriver/driver/[^/]*\.go$
-      - ^pod2daemon/flexvol/creds/[^/]*\.go$
       - ^pod2daemon/pkg/csi/[^/]*\.go$
       - ^pod2daemon/pkg/flexvol/[^/]*\.go$
       - ^typha/cmd/typha/[^/]*\.go$

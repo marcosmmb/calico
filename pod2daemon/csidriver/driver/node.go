@@ -31,7 +31,7 @@ import (
 	"google.golang.org/grpc/status"
 
 	// TODO: move the object in here to a common package
-	"github.com/projectcalico/calico/pod2daemon/flexvol/creds"
+	"github.com/projectcalico/calico/pod2daemon/csidriver/creds"
 )
 
 // Define the nodeService as per the CSI spec.

@@ -14,7 +14,7 @@
 
 package creds
 
-// Credentials are the credentials published by the Flexvolume driver
+// Credentials identify the workload that a volume was published for.
 type Credentials struct {
 	// UID is the unique identifier for the workload.
 	UID string

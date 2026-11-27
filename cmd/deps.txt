@@ -562,8 +562,8 @@ local:node/pkg/status/populators
 local:pkg/buildinfo
 local:pkg/cmdwrapper
 local:pod2daemon/binder
+local:pod2daemon/csidriver/creds
 local:pod2daemon/csidriver/driver
-local:pod2daemon/flexvol/creds
 local:pod2daemon/pkg/csi
 local:pod2daemon/pkg/flexvol
 local:typha/cmd/typha

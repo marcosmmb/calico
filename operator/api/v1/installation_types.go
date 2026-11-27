@@ -150,9 +150,10 @@ type InstallationSpec struct {
 	// +optional
 	TyphaMetricsPort *int32 `json:"typhaMetricsPort,omitempty"`
 
-	// FlexVolumePath optionally specifies a custom path for FlexVolume. If not specified, FlexVolume will be
-	// enabled by default. If set to 'None', FlexVolume will not be installed, but a driver already installed in
-	// the default path is updated. The default is based on the kubernetesProvider.
+	// FlexVolumePath is deprecated. The FlexVolume driver is no longer installed; pods must use the
+	// csi.tigera.io CSI driver instead. This field only locates a driver installed by an earlier release so that
+	// it can be removed, which happens once no pod on the node still mounts it. If not specified or set to
+	// 'None', the default path for the kubernetesProvider is used.
 	// +optional
 	FlexVolumePath string `json:"flexVolumePath,omitempty"`
 

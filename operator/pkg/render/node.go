@@ -1176,15 +1176,10 @@ func (c *nodeComponent) nodeVolumes() []corev1.Volume {
 		volumes = append(volumes, corev1.Volume{Name: "cni-plugins-stage", VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}}})
 	}
 
-	// Create and append flexvolume
-	flexVolumeHostPath := &corev1.HostPathVolumeSource{Path: c.cfg.Installation.FlexVolumePath + "nodeagent~uds", Type: &dirOrCreate}
-	if c.flexVolumeDisabled() {
-		root, _ := flexVolumeRoot(c.cfg.Installation.KubernetesProvider)
-		flexVolumeHostPath = &corev1.HostPathVolumeSource{Path: root, Type: &dirMustExist}
-	}
+	flexVolumeHostDir, flexVolumeHostDirType, _ := c.flexVolumeCleanup()
 	volumes = append(volumes, corev1.Volume{
 		Name:         "flexvol-driver-host",
-		VolumeSource: corev1.VolumeSource{HostPath: flexVolumeHostPath},
+		VolumeSource: corev1.VolumeSource{HostPath: &corev1.HostPathVolumeSource{Path: flexVolumeHostDir, Type: &flexVolumeHostDirType}},
 	})
 	if c.cfg.BirdTemplates != nil {
 		volumes = append(volumes,
@@ -1309,6 +1304,9 @@ func (c *nodeComponent) cniPluginsContainer() corev1.Container {
 	}
 }
 
+// flexVolumeDriverDir is kubelet's directory name for the nodeagent/uds FlexVolume driver.
+const flexVolumeDriverDir = "nodeagent~uds"
+
 func DefaultFlexVolumePath(provider operatorv1.Provider) string {
 	root, rel := flexVolumeRoot(provider)
 	return filepath.Join(root, rel) + "/"
@@ -1332,28 +1330,40 @@ func flexVolumeRoot(provider operatorv1.Provider) (string, string) {
 	}
 }
 
-func (c *nodeComponent) flexVolumeDisabled() bool {
-	return c.cfg.Installation.FlexVolumePath == "None"
+// flexVolumeCleanup returns the host directory to mount in order to remove a FlexVolume driver left behind by an
+// earlier release, the hostPath type to mount it with, and the driver directory's path relative to that mount.
+//
+// The driver directory's parent is mounted, not the directory itself, so that the directory can be deleted and
+// so that mounting it never creates it.
+func (c *nodeComponent) flexVolumeCleanup() (string, corev1.HostPathType, string) {
+	root, rel := flexVolumeRoot(c.cfg.Installation.KubernetesProvider)
+	path := c.cfg.Installation.FlexVolumePath
+	if path == "" || path == "None" || filepath.Clean(path) == filepath.Join(root, rel) {
+		return root, corev1.HostPathDirectory, filepath.Join(rel, flexVolumeDriverDir)
+	}
+	// Nothing guarantees that a user-supplied plugin dir exists on every node, and a missing hostPath of type
+	// Directory would stop calico-node from starting.
+	return filepath.Clean(path), corev1.HostPathDirectoryOrCreate, flexVolumeDriverDir
 }
 
-// flexVolumeContainer creates the node's init container that installs the Unix Domain Socket to allow Dikastes
-// to communicate with Felix over the Policy Sync API.
+// flexVolumeContainer creates the init container that removes the FlexVolume driver from the host. The driver is no
+// longer shipped; pods get the Policy Sync API socket from the CSI driver.
 func (c *nodeComponent) flexVolumeContainer() corev1.Container {
-	flexVolumeMounts := []corev1.VolumeMount{
-		{MountPath: "/host/driver", Name: "flexvol-driver-host"},
-	}
-	command := []string{components.CalicoBinaryPath, "component", "flexvol", "install", "--target", "/host/driver/uds"}
-	if c.flexVolumeDisabled() {
-		_, rel := flexVolumeRoot(c.cfg.Installation.KubernetesProvider)
-		command = []string{components.CalicoBinaryPath, "component", "flexvol", "install", "--if-present", "--target", filepath.Join("/host/driver", rel, "nodeagent~uds", "uds")}
-	}
-
+	_, _, rel := c.flexVolumeCleanup()
 	return corev1.Container{
-		Name:            "flexvol-driver",
-		Image:           c.calicoImage,
-		Command:         command,
+		Name:  "flexvol-driver",
+		Image: c.calicoImage,
+		Command: []string{
+			components.CalicoBinaryPath, "component", "flexvol", "uninstall",
+			"--target", filepath.Join("/host/driver", rel),
+			"--mountinfo", "/nodeproc/1/mountinfo",
+		},
 		SecurityContext: securitycontext.NewRootContext(true),
-		VolumeMounts:    flexVolumeMounts,
+		VolumeMounts: []corev1.VolumeMount{
+			{MountPath: "/host/driver", Name: "flexvol-driver-host"},
+			// The host's mount table shows whether any pod still has a FlexVolume volume mounted.
+			{MountPath: "/nodeproc", Name: "nodeproc", ReadOnly: true},
+		},
 	}
 }
 

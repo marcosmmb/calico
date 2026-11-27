@@ -12,621 +12,161 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// Flexvolume driver that is invoked by kubelet when a pod installs a flexvolume drive
-// of type nodeagent/uds
-// This driver communicates to the nodeagent using either
-//   - (Default) writing credentials of workloads to a file or
-//   - gRPC message defined at protos/nodeagementmgmt.proto,
-//
-// to shares the properties of the pod with nodeagent.
+// Package flexvol removes the nodeagent/uds FlexVolume driver that earlier
+// releases installed on the host. Calico no longer ships that driver; pods get
+// their policy sync socket from the CSI driver instead.
 package flexvol
 
 import (
-	"encoding/json"
+	"bufio"
 	"errors"
 	"fmt"
 	"io"
 	"io/fs"
-	"log/syslog"
 	"os"
-	"os/exec"
 	"path/filepath"
-	"regexp"
 	"strings"
 
+	"github.com/sirupsen/logrus"
 	"github.com/spf13/cobra"
-
-	"github.com/projectcalico/calico/pkg/buildinfo"
-	creds "github.com/projectcalico/calico/pod2daemon/flexvol/creds"
 )
-
-// Response is the output of Flex volume driver to the kubelet.
-type Response struct {
-	Status  string `json:"status"`
-	Message string `json:"message"`
-	// Is attached resp.
-	Attached bool `json:"attached,omitempty"`
-	// Dev mount resp.
-	Device string `json:"device,omitempty"`
-	// Volumen name resp.
-	VolumeName string `json:"volumename,omitempty"`
-}
-
-// Capabilities describes the driver capabilities reported to kubelet.
-type Capabilities struct {
-	Attach bool `json:"attach"`
-}
-
-// InitResponse is the response to the 'init' command.
-// We want to explicitly set and send Attach: false
-// that is why it is separated from the Response struct.
-type InitResponse struct {
-	Status  string `json:"status"`
-	Message string `json:"message"`
-	// Capability resp.
-	Capabilities *Capabilities `json:"capabilities"`
-}
-
-// ConfigurationOptions may be used to setup the driver.
-// These are optional and most users will not depend on them and will instead use the defaults.
-type ConfigurationOptions struct {
-	// Version of the Kubernetes cluster on which the driver is running.
-	K8sVersion string `json:"k8s_version,omitempty"`
-	// Location on the node's filesystem where the driver will host the
-	// per workload directory and the credentials for the workload.
-	// Default: /var/run/nodeagent
-	NodeAgentManagementHomeDir string `json:"nodeagent_management_home,omitempty"`
-	// Relative location to NodeAgentManagementHomeDir where per workload directory
-	// will be created.
-	// Default: /mount
-	// For example: /mount here implies /var/run/nodeagent/mount/ directory
-	// on the node.
-	NodeAgentWorkloadHomeDir string `json:"nodeagent_workload_home,omitempty"`
-	// Relative location to NodeAgentManagementHomeDir where per workload credential
-	// files will be created.
-	// Default: /creds
-	// For example: /creds here implies /var/run/nodeagent/creds/ directory
-	NodeAgentCredentialsHomeDir string `json:"nodeagent_credentials_home,omitempty"`
-	// Log level for loggint to node syslog. Options: INFO|WARNING
-	// Default: WARNING
-	LogLevel string `json:"log_level,omitempty"`
-}
-
-// Option keys used by kubelet to notify it of volume mounts/unmounts.
-const (
-	optPodUID         = "kubernetes.io/pod.uid"
-	optPodName        = "kubernetes.io/pod.name"
-	optPodNamespace   = "kubernetes.io/pod.namespace"
-	optServiceAccount = "kubernetes.io/serviceAccount.name"
-)
-
-var (
-	podUIDUUIDRegexp = regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$`)
-	podUIDHashRegexp = regexp.MustCompile(`^[0-9a-f]{32}$`)
-)
-
-func validPodUID(uid string) bool {
-	return podUIDUUIDRegexp.MatchString(uid) || podUIDHashRegexp.MatchString(uid)
-}
 
 const (
-	SYSLOGTAG       string = "FlexVolNodeAgent"
-	VER_K8S         string = "1.8"
-	CONFIG_FILE     string = "/etc/flexvolume/nodeagent.json"
-	NODEAGENT_HOME  string = "/var/run/nodeagent"
-	MOUNT_DIR       string = "/mount"
-	CREDS_DIR       string = "/creds"
-	LOG_LEVEL_WARN  string = "WARNING"
-	syslogOnlyTrue  bool   = true
-	syslogOnlyFalse bool   = false
+	// driverDirName is kubelet's on-disk name for the nodeagent/uds driver,
+	// both in its plugin directory and in each pod's volumes directory.
+	driverDirName = "nodeagent~uds"
+	driverBinary  = "uds"
+	// tmpBinaryPrefix matches the temp files the installer wrote next to the
+	// driver before renaming them into place.
+	tmpBinaryPrefix = ".uds."
 )
 
-var (
-	// logWriter is used to notify syslog of the functionality of the driver.
-	logWriter *syslog.Writer
-	// configuration is the active configuration that is being used by the driver.
-	configuration *ConfigurationOptions
-	// defaultConfiguration is the default configuration for the driver.
-	defaultConfiguration ConfigurationOptions = ConfigurationOptions{
-		K8sVersion:                  VER_K8S,
-		NodeAgentManagementHomeDir:  NODEAGENT_HOME,
-		NodeAgentWorkloadHomeDir:    NODEAGENT_HOME + MOUNT_DIR,
-		NodeAgentCredentialsHomeDir: NODEAGENT_HOME + CREDS_DIR,
-		LogLevel:                    LOG_LEVEL_WARN,
-	}
-)
-
-// NewCommand returns the root cobra command for the flexvol driver.
+// NewCommand returns the root cobra command for FlexVolume driver cleanup.
 func NewCommand() *cobra.Command {
 	rootCmd := &cobra.Command{
 		Use:           "flexvol",
+		Short:         "Clean up the legacy FlexVolume driver.",
 		SilenceErrors: true,
 		SilenceUsage:  true,
-		PersistentPreRunE: func(cmd *cobra.Command, args []string) error {
-			var err error
-			logWriter, err = syslog.New(syslog.LOG_WARNING|syslog.LOG_DAEMON, SYSLOGTAG)
-			if err != nil {
-				logWriter = nil
-			}
-			initConfiguration()
-			return nil
-		},
-		PersistentPostRunE: func(cmd *cobra.Command, args []string) error {
-			if logWriter != nil {
-				_ = logWriter.Close()
-			}
-			return nil
-		},
 	}
 
-	initCmd := &cobra.Command{
-		Use:   "init",
-		Short: "Flex volume init command.",
-		Long:  "Flex volume init command.",
+	var target, mountInfo string
+	uninstallCmd := &cobra.Command{
+		Use:   "uninstall",
+		Short: "Remove the FlexVolume driver from the host filesystem.",
+		Long: "Uninstall removes the nodeagent~uds driver directory given by --target. " +
+			"The driver is left in place while any pod on the host still has one of its " +
+			"volumes mounted, because kubelet needs the driver to unmount them.",
 		RunE: func(c *cobra.Command, args []string) error {
-			if len(args) != 0 {
-				return fmt.Errorf("init takes no arguments")
-			}
-			return initCommand()
+			return uninstallDriver(target, mountInfo)
 		},
 	}
+	uninstallCmd.Flags().StringVar(&target, "target", "", "Path to the driver directory on the host (e.g. /host/driver/nodeagent~uds).")
+	uninstallCmd.Flags().StringVar(&mountInfo, "mountinfo", "", "Path to the host's mountinfo file (e.g. /nodeproc/1/mountinfo).")
 
-	mountCmd := &cobra.Command{
-		Use:   "mount",
-		Short: "Flex volume mount command.",
-		Long:  "Flex volume mount command.",
-		RunE: func(c *cobra.Command, args []string) error {
-			if len(args) < 2 {
-				return fmt.Errorf("mount takes 2 args")
-			}
-			return mount(args[0], args[1])
-		},
-	}
-
-	unmountCmd := &cobra.Command{
-		Use:   "unmount",
-		Short: "Flex volume unmount command.",
-		Long:  "Flex volume unmount command.",
-		RunE: func(c *cobra.Command, args []string) error {
-			if len(args) < 1 {
-				return fmt.Errorf("unmount takes 1 args")
-			}
-			return unmount(args[0])
-		},
-	}
-
-	versionCmd := &cobra.Command{
-		Use:   "version",
-		Short: "Print version",
-		Long:  "Flex volume driver version",
-		RunE: func(c *cobra.Command, args []string) error {
-			fmt.Printf("Version is %s\n", buildinfo.Version)
-			return nil
-		},
-	}
-
-	var installTarget string
-	var installIfPresent bool
-	installCmd := &cobra.Command{
-		Use:   "install",
-		Short: "Install the flex volume driver onto the host filesystem.",
-		Long: "Install copies the running binary to --target with mode 0550. " +
-			"The basename must be 'uds' since kubelet calls the driver as " +
-			"<plugin-dir>/uds and the argv[0] dispatch only matches that name. " +
-			"Must run as root - the target dir is typically owned by root.",
-		RunE: func(c *cobra.Command, args []string) error {
-			if installIfPresent {
-				return installDriverIfPresent(installTarget)
-			}
-			return installDriver(installTarget)
-		},
-	}
-	installCmd.Flags().StringVar(&installTarget, "target", "", "Path on the host where the driver binary is installed (e.g. /host/driver/uds).")
-	installCmd.Flags().BoolVar(&installIfPresent, "if-present", false, "Only replace a driver that is already installed.")
-
-	rootCmd.AddCommand(versionCmd)
-	rootCmd.AddCommand(initCmd)
-	rootCmd.AddCommand(mountCmd)
-	rootCmd.AddCommand(unmountCmd)
-	rootCmd.AddCommand(installCmd)
-
+	rootCmd.AddCommand(uninstallCmd)
 	return rootCmd
 }
 
-// installDriver copies the running binary to target with mode 0550. Uses
-// write-tmp-then-rename so a kubelet mid-invocation never sees a partial
-// file. Target basename must be "uds" - the argv[0] dispatch in
-// cmd/calico/main.go only routes that name back into this package.
-func installDriver(target string) error {
+func uninstallDriver(target, mountInfoPath string) error {
 	if target == "" {
 		return fmt.Errorf("target is required")
 	}
-	if base := filepath.Base(target); base != "uds" {
-		return fmt.Errorf("target basename must be \"uds\", got %q", base)
+	if mountInfoPath == "" {
+		return fmt.Errorf("mountinfo is required")
 	}
-	src, err := os.Executable()
-	if err != nil {
-		return fmt.Errorf("resolving running binary: %w", err)
-	}
-
-	in, err := os.Open(src)
-	if err != nil {
-		return fmt.Errorf("opening %s: %w", src, err)
-	}
-	defer func() {
-		if err := in.Close(); err != nil {
-			logError("installDriver", target, fmt.Sprintf("failed to close source file %s: %s\n", src, err.Error()), syslogOnlyTrue)
-		}
-	}()
-
-	dir := filepath.Dir(target)
-	tmp, err := os.CreateTemp(dir, ".uds.*")
-	if err != nil {
-		return fmt.Errorf("creating temp file in %s: %w", dir, err)
-	}
-	tmpPath := tmp.Name()
-	defer func() {
-		if err := os.Remove(tmpPath); err != nil {
-			logError("installDriver", target, fmt.Sprintf("failed to remove temp file %s: %s\n", tmpPath, err.Error()), syslogOnlyTrue)
-		}
-	}()
-
-	if _, err := io.Copy(tmp, in); err != nil {
-		if err := tmp.Close(); err != nil {
-			logError("installDriver", target, fmt.Sprintf("failed to close temp file %s: %s\n", tmpPath, err.Error()), syslogOnlyTrue)
-		}
-		return fmt.Errorf("copying binary: %w", err)
-	}
-	if err := tmp.Chmod(0o550); err != nil {
-		if err := tmp.Close(); err != nil {
-			logError("installDriver", target, fmt.Sprintf("failed to close temp file %s: %s\n", tmpPath, err.Error()), syslogOnlyTrue)
-		}
-		return fmt.Errorf("chmod temp file: %w", err)
-	}
-	if err := tmp.Close(); err != nil {
-		return fmt.Errorf("closing temp file: %w", err)
+	if base := filepath.Base(target); base != driverDirName {
+		return fmt.Errorf("target basename must be %q, got %q", driverDirName, base)
 	}
 
-	if err := os.Rename(tmpPath, target); err != nil {
-		return fmt.Errorf("renaming %s to %s: %w", tmpPath, target, err)
-	}
-	return nil
-}
-
-func installDriverIfPresent(target string) error {
-	if _, err := os.Lstat(target); errors.Is(err, fs.ErrNotExist) {
+	info, err := os.Lstat(target)
+	if errors.Is(err, fs.ErrNotExist) {
 		return nil
 	} else if err != nil {
 		return err
 	}
-	return installDriver(target)
-}
+	if !info.IsDir() {
+		return fmt.Errorf("%s is not a directory", target)
+	}
 
-// initCommand handles the init command for the driver.
-func initCommand() error {
-	if configuration.K8sVersion == "1.8" {
-		resp, err := json.Marshal(&InitResponse{Status: "Success", Message: "Init ok.", Capabilities: &Capabilities{Attach: false}})
-		if err != nil {
-			return err
-		}
-		fmt.Println(string(resp))
+	inUse, err := mountedDriverVolumes(mountInfoPath)
+	if err != nil {
+		return fmt.Errorf("checking for mounted FlexVolume volumes: %w", err)
+	}
+	if len(inUse) > 0 {
+		logrus.WithField("mounts", inUse).Warn(
+			"Leaving the deprecated FlexVolume driver installed because pods on this node still mount it. " +
+				"Migrate those pods to the csi.tigera.io CSI driver; the driver is removed the next time calico-node starts without them.")
 		return nil
 	}
-	return genericSuccess("init", "", "Init ok.")
-}
 
-// checkValidMountOpts checks if there are sufficient inputs to
-// call node agent.
-func checkValidMountOpts(dir, opts string) (*creds.Credentials, string, bool) {
-	var inputs map[string]string
-	if err := json.Unmarshal([]byte(opts), &inputs); err != nil {
-		return nil, "", false
-	}
-
-	uid, err := podUIDFromDir(dir)
-	if err != nil || inputs[optPodUID] != uid {
-		return nil, "", false
-	}
-
-	return &creds.Credentials{
-		UID:            uid,
-		Workload:       inputs[optPodName],
-		Namespace:      inputs[optPodNamespace],
-		ServiceAccount: inputs[optServiceAccount],
-	}, uid, true
-}
-
-func podUIDFromDir(dir string) (string, error) {
-	comps := strings.Split(filepath.Clean(dir), "/")
-	n := len(comps)
-	if n < 5 || comps[n-2] != "nodeagent~uds" || comps[n-3] != "volumes" || comps[n-5] != "pods" {
-		return "", fmt.Errorf("unexpected volume dir %q", dir)
-	}
-	if uid := comps[n-4]; validPodUID(uid) {
-		return uid, nil
-	}
-	return "", fmt.Errorf("invalid pod uid in volume dir %q", dir)
-}
-
-func pathUnder(base, elem string) (string, error) {
-	if elem == "" || elem == "." || elem == ".." || strings.ContainsRune(elem, '/') {
-		return "", fmt.Errorf("invalid path element %q", elem)
-	}
-	p := filepath.Join(base, elem)
-	if rel, err := filepath.Rel(base, p); err != nil || rel != elem {
-		return "", fmt.Errorf("path %q escapes %q", p, base)
-	}
-	return p, nil
-}
-
-// doMount handles a new workload mounting the flex volume drive. It will:
-// * mount a tmpfs at the destinationDir(ectory) of the workload created by the kubelet.
-// * create a sub-directory ('nodeagent') there
-// * do a bind mount of the nodeagent's directory on the node to the destinationDir/nodeagent.
-func doMount(destinationDir string, ninputs *creds.Credentials, workloadPath string) error {
-	inp := strings.Join([]string{destinationDir, workloadPath}, "|")
-	newDir, err := pathUnder(configuration.NodeAgentWorkloadHomeDir, workloadPath)
+	entries, err := os.ReadDir(target)
 	if err != nil {
 		return err
 	}
-	err = os.MkdirAll(newDir, 0o777)
-	if err != nil {
-		logError("doMount", inp, fmt.Sprintf("failed to create directory %s\n", newDir), syslogOnlyTrue)
-		return err
-	}
-
-	// Not really needed but attempt to workaround:
-	// https://github.com/kubernetes/kubernetes/blob/61ac9d46382884a8bd9e228da22bca5817f6d226/pkg/util/mount/mount_linux.go
-	cmdMount := exec.Command("/bin/mount", "-t", "tmpfs", "-o", "size=8K", "tmpfs", destinationDir)
-	err = cmdMount.Run()
-	if err != nil {
-		_ = os.RemoveAll(newDir)
-		return err
-	}
-
-	newDestinationDir := destinationDir + "/nodeagent"
-	err = os.MkdirAll(newDestinationDir, 0o777)
-	if err != nil {
-		cmd := exec.Command("/bin/umount", destinationDir)
-		e := cmd.Run()
-		if e != nil {
-			logError("doMount", inp, fmt.Sprintf("failed to unmount %s\n", destinationDir), syslogOnlyTrue)
+	for _, e := range entries {
+		if e.Name() != driverBinary && !strings.HasPrefix(e.Name(), tmpBinaryPrefix) {
+			continue
 		}
-		e = os.RemoveAll(newDir)
-		if e != nil {
-			logError("doMount", inp, fmt.Sprintf("failed to clear %s\n", newDir), syslogOnlyTrue)
+		if err := os.Remove(filepath.Join(target, e.Name())); err != nil {
+			return err
+		}
+	}
+
+	// Anything else in the directory was not put there by Calico, so the
+	// directory is only removed if it is now empty.
+	if err := os.Remove(target); err != nil {
+		if remaining, readErr := os.ReadDir(target); readErr == nil && len(remaining) > 0 {
+			logrus.WithField("dir", target).Warn("Removed the FlexVolume driver but left its directory, which holds other files.")
+			return nil
 		}
 		return err
 	}
-
-	// Do a bind mount
-	cmd := exec.Command("/bin/mount", "--bind", newDir, newDestinationDir)
-	err = cmd.Run()
-	if err != nil {
-		cmd = exec.Command("/bin/umount", destinationDir)
-		e := cmd.Run()
-		if e != nil {
-			logError("doMount", inp, fmt.Sprintf("failed to unmount %s\n", destinationDir), syslogOnlyTrue)
-		}
-		e = os.RemoveAll(newDir)
-		if e != nil {
-			logError("doMount", inp, fmt.Sprintf("failed to clear %s\n", newDir), syslogOnlyTrue)
-		}
-		return err
-	}
-
+	logrus.WithField("dir", target).Info("Removed the FlexVolume driver.")
 	return nil
 }
 
-// doUnmount will unmount the directory
-func doUnmount(dir string) error {
-	cmd := exec.Command("/bin/umount", dir)
-	err := cmd.Run()
+// mountedDriverVolumes returns the mount points of nodeagent/uds volumes
+// listed in the given mountinfo file.
+func mountedDriverVolumes(mountInfoPath string) ([]string, error) {
+	f, err := os.Open(mountInfoPath)
 	if err != nil {
-		return err
+		return nil, err
 	}
-
-	return nil
+	defer func() { _ = f.Close() }()
+	return parseDriverMounts(f)
 }
 
-// mount handles the mount command to the driver.
-func mount(dir, opts string) error {
-	inp := strings.Join([]string{dir, opts}, "|")
+func parseDriverMounts(r io.Reader) ([]string, error) {
+	// Kubelet mounts a pod's volume at <root>/pods/<uid>/volumes/<driver>/<name>.
+	marker := "/volumes/" + driverDirName + "/"
 
-	ninputs, workloadPath, s := checkValidMountOpts(dir, opts)
-	if !s {
-		logError("mount", inp, "Incomplete inputs", syslogOnlyFalse)
-		return fmt.Errorf("invalid mount options")
-	}
-
-	if err := doMount(dir, ninputs, workloadPath); err != nil {
-		sErr := "Failure to mount: " + err.Error()
-		logError("mount", inp, sErr, syslogOnlyFalse)
-		return err
-	}
-
-	if err := addCredentialFile(ninputs); err != nil {
-		sErr := "Failure to create credentials: " + err.Error()
-		logError("mount", inp, sErr, syslogOnlyFalse)
-		return err
-	}
-
-	return genericSuccess("mount", inp, "Mount ok.")
-}
-
-// unmount handles the unmount command to the driver.
-func unmount(dir string) error {
-	var emsgs []string
-	uid, uidErr := podUIDFromDir(dir)
-	if uidErr != nil {
-		emsgs = append(emsgs, "Skipping credentials and directory cleanup: "+uidErr.Error())
-	} else if err := removeCredentialFile(&creds.Credentials{UID: uid}); err != nil {
-		// Go ahead and finish the unmount; no need to hold up kubelet.
-		emsgs = append(emsgs, "Failure to delete credentials file: "+err.Error())
-	}
-
-	// unmount the bind mount
-	err := doUnmount(dir + "/nodeagent")
-	if err != nil {
-		logError("umount", dir, fmt.Sprintf("failed to unmount %s/nodeagent\n", dir), syslogOnlyTrue)
-	}
-	// unmount the tmpfs
-	err = doUnmount(dir)
-	if err != nil {
-		logError("unmount", dir, fmt.Sprintf("failed to unmount %s\n", dir), syslogOnlyTrue)
-	}
-	// delete the directory that was created.
-	if uidErr == nil {
-		delDir, err := pathUnder(configuration.NodeAgentWorkloadHomeDir, uid)
-		if err == nil {
-			err = os.Remove(delDir)
+	var mounts []string
+	seen := map[string]bool{}
+	scanner := bufio.NewScanner(r)
+	for scanner.Scan() {
+		// The mount point is the fifth field of a mountinfo line.
+		fields := strings.Fields(scanner.Text())
+		if len(fields) < 5 {
+			continue
 		}
-		if err != nil {
-			emsgs = append(emsgs, fmt.Sprintf("unmount del failure %s: %s", delDir, err.Error()))
-			// go ahead and return indicating success
+		idx := strings.Index(fields[4], marker)
+		if idx < 0 {
+			continue
+		}
+		// The driver bind-mounts a subdirectory inside each volume; report
+		// the volume once.
+		volume := fields[4]
+		if end := strings.Index(volume[idx+len(marker):], "/"); end >= 0 {
+			volume = volume[:idx+len(marker)+end]
+		}
+		if !seen[volume] {
+			seen[volume] = true
+			mounts = append(mounts, volume)
 		}
 	}
-
-	if len(emsgs) == 0 {
-		emsgs = append(emsgs, "Unmount Ok")
+	if err := scanner.Err(); err != nil {
+		return nil, err
 	}
-
-	return genericSuccess("unmount", dir, strings.Join(emsgs, ","))
-}
-
-// genericSuccess prints a success message to the kubelet.
-func genericSuccess(caller, inp, msg string) error {
-	resp, err := json.Marshal(&Response{Status: "Success", Message: msg})
-	if err != nil {
-		return err
-	}
-
-	fmt.Println(string(resp))
-	logToSys(caller, inp, string(resp))
-	return nil
-}
-
-// logError prints an error message to the kubelet and the system log. The 'syslogOnly' argument can be used to prevent messages from
-// getting sent to kubelet. This option should be used if a type of error can lead to a flood of similar messages, such as in
-// periodic activity or in retry loops.
-func logError(caller, inp, msg string, syslogOnly bool) {
-	resp, err := json.Marshal(&Response{Status: "Failure", Message: msg})
-	if err == nil {
-		if !syslogOnly {
-			fmt.Println(string(resp))
-		}
-		logToSys(caller, inp, string(resp))
-	}
-}
-
-// logToSys is a helper routine to genericSuccess() and logError().
-// Routines needing to log messages should call those functions and NOT logToSys() or logWriter methods directly.
-func logToSys(caller, inp, opts string) {
-	if logWriter == nil {
-		return
-	}
-
-	opt := strings.Join([]string{caller, inp, opts}, "|")
-
-	if configuration.LogLevel == LOG_LEVEL_WARN {
-		_ = logWriter.Warning(opt)
-	} else {
-		_ = logWriter.Info(opt)
-	}
-}
-
-// addCredentialFile is used to create a credential file when a workload with the flex-volume volume mounted is created.
-func addCredentialFile(ninputs *creds.Credentials) error {
-	// Make the directory and then write the ninputs as json to it.
-	err := os.MkdirAll(configuration.NodeAgentCredentialsHomeDir, 0o755)
-	if err != nil {
-		return err
-	}
-
-	var attrs []byte
-	attrs, err = json.Marshal(ninputs)
-	if err != nil {
-		return err
-	}
-
-	credsFileTmp, err := pathUnder(configuration.NodeAgentManagementHomeDir, ninputs.UID+".json")
-	if err != nil {
-		return err
-	}
-	_ = os.WriteFile(credsFileTmp, attrs, 0o644)
-
-	// Move it to the right location now.
-	credsFile, err := pathUnder(configuration.NodeAgentCredentialsHomeDir, ninputs.UID+".json")
-	if err != nil {
-		return err
-	}
-	return os.Rename(credsFileTmp, credsFile)
-}
-
-// removeCredentialFile is used to delete a credential file when a workload with the flex-volume volume mounted is deleted.
-func removeCredentialFile(ninputs *creds.Credentials) error {
-	credsFile, err := pathUnder(configuration.NodeAgentCredentialsHomeDir, ninputs.UID+".json")
-	if err != nil {
-		return err
-	}
-	return os.Remove(credsFile)
-}
-
-// initConfiguration reads the configuration file if available and initializes the
-// configuration options of the driver.
-func initConfiguration() {
-	configuration = &defaultConfiguration
-	if _, err := os.Stat(CONFIG_FILE); err != nil {
-		// Return quietly
-		return
-	}
-
-	bytes, err := os.ReadFile(CONFIG_FILE)
-	if err != nil {
-		logError("initConfiguration", "", fmt.Sprintf("Not able to read %s: %s\n", CONFIG_FILE, err.Error()), syslogOnlyTrue)
-		return
-	}
-
-	var config ConfigurationOptions
-	err = json.Unmarshal(bytes, &config)
-	if err != nil {
-		logError("initConfiguration", "", fmt.Sprintf("Not able to parst %s: %s\n", CONFIG_FILE, err.Error()), syslogOnlyTrue)
-		return
-	}
-
-	// fill in if missing configurations
-	if len(config.NodeAgentManagementHomeDir) == 0 {
-		config.NodeAgentManagementHomeDir = NODEAGENT_HOME
-	}
-
-	if len(config.NodeAgentWorkloadHomeDir) == 0 {
-		config.NodeAgentWorkloadHomeDir = MOUNT_DIR
-	}
-
-	if len(config.NodeAgentCredentialsHomeDir) == 0 {
-		config.NodeAgentCredentialsHomeDir = CREDS_DIR
-	}
-
-	if len(config.LogLevel) == 0 {
-		config.LogLevel = LOG_LEVEL_WARN
-	}
-
-	if len(config.K8sVersion) == 0 {
-		config.K8sVersion = VER_K8S
-	}
-
-	// Convert to absolute paths.
-	prefix := ""
-	if !strings.HasPrefix(config.NodeAgentWorkloadHomeDir, "/") {
-		prefix = "/"
-	}
-	config.NodeAgentWorkloadHomeDir = strings.Join([]string{config.NodeAgentManagementHomeDir, config.NodeAgentWorkloadHomeDir}, prefix)
-
-	prefix = ""
-	if !strings.HasPrefix(config.NodeAgentCredentialsHomeDir, "/") {
-		prefix = "/"
-	}
-	config.NodeAgentCredentialsHomeDir = strings.Join([]string{config.NodeAgentManagementHomeDir, config.NodeAgentCredentialsHomeDir}, prefix)
-
-	configuration = &config
+	return mounts, nil
 }

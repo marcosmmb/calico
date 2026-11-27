@@ -400,7 +400,7 @@ var _ = Describe("Node rendering tests", func() {
 							},
 						},
 					},
-					{Name: "flexvol-driver-host", VolumeSource: corev1.VolumeSource{HostPath: &corev1.HostPathVolumeSource{Path: "/usr/libexec/kubernetes/kubelet-plugins/volume/exec/nodeagent~uds", Type: &dirOrCreate}}},
+					{Name: "flexvol-driver-host", VolumeSource: corev1.VolumeSource{HostPath: &corev1.HostPathVolumeSource{Path: "/usr", Type: &dirMustExist}}},
 				}
 				Expect(ds.Spec.Template.Spec.Volumes).To(ConsistOf(expectedVols))
 
@@ -597,7 +597,7 @@ var _ = Describe("Node rendering tests", func() {
 							},
 						},
 					},
-					{Name: "flexvol-driver-host", VolumeSource: corev1.VolumeSource{HostPath: &corev1.HostPathVolumeSource{Path: "/usr/libexec/kubernetes/kubelet-plugins/volume/exec/nodeagent~uds", Type: &dirOrCreate}}},
+					{Name: "flexvol-driver-host", VolumeSource: corev1.VolumeSource{HostPath: &corev1.HostPathVolumeSource{Path: "/usr", Type: &dirMustExist}}},
 				}
 				Expect(ds.Spec.Template.Spec.Volumes).To(ConsistOf(expectedVols))
 
@@ -892,7 +892,7 @@ var _ = Describe("Node rendering tests", func() {
 							},
 						},
 					},
-					{Name: "flexvol-driver-host", VolumeSource: corev1.VolumeSource{HostPath: &corev1.HostPathVolumeSource{Path: "/usr/libexec/kubernetes/kubelet-plugins/volume/exec/nodeagent~uds", Type: &dirOrCreate}}},
+					{Name: "flexvol-driver-host", VolumeSource: corev1.VolumeSource{HostPath: &corev1.HostPathVolumeSource{Path: "/usr", Type: &dirMustExist}}},
 				}
 				Expect(ds.Spec.Template.Spec.Volumes).To(ConsistOf(expectedVols))
 
@@ -1030,7 +1030,7 @@ var _ = Describe("Node rendering tests", func() {
 							},
 						},
 					},
-					{Name: "flexvol-driver-host", VolumeSource: corev1.VolumeSource{HostPath: &corev1.HostPathVolumeSource{Path: "/usr/libexec/kubernetes/kubelet-plugins/volume/exec/nodeagent~uds", Type: &dirOrCreate}}},
+					{Name: "flexvol-driver-host", VolumeSource: corev1.VolumeSource{HostPath: &corev1.HostPathVolumeSource{Path: "/usr", Type: &dirMustExist}}},
 				}
 				Expect(ds.Spec.Template.Spec.Volumes).To(ConsistOf(expectedVols))
 
@@ -1303,7 +1303,7 @@ var _ = Describe("Node rendering tests", func() {
 							},
 						},
 					},
-					{Name: "flexvol-driver-host", VolumeSource: corev1.VolumeSource{HostPath: &corev1.HostPathVolumeSource{Path: "/usr/libexec/kubernetes/kubelet-plugins/volume/exec/nodeagent~uds", Type: &dirOrCreate}}},
+					{Name: "flexvol-driver-host", VolumeSource: corev1.VolumeSource{HostPath: &corev1.HostPathVolumeSource{Path: "/usr", Type: &dirMustExist}}},
 				}
 				Expect(ds.Spec.Template.Spec.Volumes).To(ConsistOf(expectedVols))
 
@@ -1438,7 +1438,7 @@ var _ = Describe("Node rendering tests", func() {
 							},
 						},
 					},
-					{Name: "flexvol-driver-host", VolumeSource: corev1.VolumeSource{HostPath: &corev1.HostPathVolumeSource{Path: "/usr/libexec/kubernetes/kubelet-plugins/volume/exec/nodeagent~uds", Type: &dirOrCreate}}},
+					{Name: "flexvol-driver-host", VolumeSource: corev1.VolumeSource{HostPath: &corev1.HostPathVolumeSource{Path: "/usr", Type: &dirMustExist}}},
 				}
 				Expect(ds.Spec.Template.Spec.Volumes).To(ConsistOf(expectedVols))
 
@@ -1532,7 +1532,7 @@ var _ = Describe("Node rendering tests", func() {
 					{Name: "var-log-calico", VolumeSource: corev1.VolumeSource{HostPath: &corev1.HostPathVolumeSource{Path: "/var/log/calico", Type: &dirOrCreate}}},
 					{Name: "cni-plugins-stage", VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}}},
 					{Name: "policysync", VolumeSource: corev1.VolumeSource{HostPath: &corev1.HostPathVolumeSource{Path: "/var/run/nodeagent", Type: &dirOrCreate}}},
-					{Name: "flexvol-driver-host", VolumeSource: corev1.VolumeSource{HostPath: &corev1.HostPathVolumeSource{Path: "/etc/kubernetes/kubelet-plugins/volume/exec/nodeagent~uds", Type: &dirOrCreate}}},
+					{Name: "flexvol-driver-host", VolumeSource: corev1.VolumeSource{HostPath: &corev1.HostPathVolumeSource{Path: "/etc/kubernetes", Type: &dirMustExist}}},
 					{Name: "sys-fs", VolumeSource: corev1.VolumeSource{HostPath: &corev1.HostPathVolumeSource{Path: "/sys/fs", Type: &dirOrCreate}}},
 					{Name: "bpffs", VolumeSource: corev1.VolumeSource{HostPath: &corev1.HostPathVolumeSource{Path: "/sys/fs/bpf", Type: &dirMustExist}}},
 					{Name: "nodeproc", VolumeSource: corev1.VolumeSource{HostPath: &corev1.HostPathVolumeSource{Path: "/proc"}}},
@@ -1926,9 +1926,9 @@ var _ = Describe("Node rendering tests", func() {
 				}
 			})
 
-			DescribeTable("should replace an installed FlexVolume driver in the provider's plugin dir if FlexVolumePath is None",
-				func(provider operatorv1.Provider, root, target string) {
-					defaultInstance.FlexVolumePath = "None"
+			DescribeTable("should remove a FlexVolume driver from the plugin dir",
+				func(provider operatorv1.Provider, flexVolumePath, hostDir string, hostDirType corev1.HostPathType, target string) {
+					defaultInstance.FlexVolumePath = flexVolumePath
 					defaultInstance.KubernetesProvider = provider
 					component := render.Node(&cfg)
 					Expect(component.ResolveImages(nil)).To(BeNil())
@@ -1940,20 +1940,29 @@ var _ = Describe("Node rendering tests", func() {
 
 					fv := rtest.GetContainer(ds.Spec.Template.Spec.InitContainers, "flexvol-driver")
 					Expect(fv).NotTo(BeNil())
-					Expect(fv.Command).To(Equal([]string{components.CalicoBinaryPath, "component", "flexvol", "install", "--if-present", "--target", target}))
-					Expect(fv.VolumeMounts).To(Equal([]corev1.VolumeMount{{MountPath: "/host/driver", Name: "flexvol-driver-host"}}))
+					Expect(fv.Command).To(Equal([]string{
+						components.CalicoBinaryPath, "component", "flexvol", "uninstall",
+						"--target", target,
+						"--mountinfo", "/nodeproc/1/mountinfo",
+					}))
+					Expect(fv.VolumeMounts).To(Equal([]corev1.VolumeMount{
+						{MountPath: "/host/driver", Name: "flexvol-driver-host"},
+						{MountPath: "/nodeproc", Name: "nodeproc", ReadOnly: true},
+					}))
 
-					dirMustExist := corev1.HostPathDirectory
+					// The driver directory itself must never be the hostPath: mounting it would create it.
 					Expect(ds.Spec.Template.Spec.Volumes).To(ContainElement(corev1.Volume{
 						Name:         "flexvol-driver-host",
-						VolumeSource: corev1.VolumeSource{HostPath: &corev1.HostPathVolumeSource{Path: root, Type: &dirMustExist}},
+						VolumeSource: corev1.VolumeSource{HostPath: &corev1.HostPathVolumeSource{Path: hostDir, Type: &hostDirType}},
 					}))
 				},
-				Entry("default", operatorv1.ProviderNone, "/usr", "/host/driver/libexec/kubernetes/kubelet-plugins/volume/exec/nodeagent~uds/uds"),
-				Entry("OpenShift", operatorv1.ProviderOpenShift, "/etc/kubernetes", "/host/driver/kubelet-plugins/volume/exec/nodeagent~uds/uds"),
-				Entry("GKE", operatorv1.ProviderGKE, "/home/kubernetes", "/host/driver/flexvolume/nodeagent~uds/uds"),
-				Entry("AKS", operatorv1.ProviderAKS, "/etc/kubernetes", "/host/driver/volumeplugins/nodeagent~uds/uds"),
-				Entry("RKE2", operatorv1.ProviderRKE2, "/var/lib/kubelet", "/host/driver/volumeplugins/nodeagent~uds/uds"),
+				Entry("None, default provider", operatorv1.ProviderNone, "None", "/usr", corev1.HostPathDirectory, "/host/driver/libexec/kubernetes/kubelet-plugins/volume/exec/nodeagent~uds"),
+				Entry("None, OpenShift", operatorv1.ProviderOpenShift, "None", "/etc/kubernetes", corev1.HostPathDirectory, "/host/driver/kubelet-plugins/volume/exec/nodeagent~uds"),
+				Entry("None, GKE", operatorv1.ProviderGKE, "None", "/home/kubernetes", corev1.HostPathDirectory, "/host/driver/flexvolume/nodeagent~uds"),
+				Entry("None, AKS", operatorv1.ProviderAKS, "None", "/etc/kubernetes", corev1.HostPathDirectory, "/host/driver/volumeplugins/nodeagent~uds"),
+				Entry("None, RKE2", operatorv1.ProviderRKE2, "None", "/var/lib/kubelet", corev1.HostPathDirectory, "/host/driver/volumeplugins/nodeagent~uds"),
+				Entry("provider default path", operatorv1.ProviderGKE, "/home/kubernetes/flexvolume/", "/home/kubernetes", corev1.HostPathDirectory, "/host/driver/flexvolume/nodeagent~uds"),
+				Entry("custom path", operatorv1.ProviderNone, "/opt/custom/plugins/", "/opt/custom/plugins", corev1.HostPathDirectoryOrCreate, "/host/driver/nodeagent~uds"),
 			)
 
 			It("should omit the cni-plugins init container when CNI.InstallMode is CalicoOnly", func() {
@@ -3256,7 +3265,7 @@ func verifyInitContainers(ds *appsv1.DaemonSet, instance *operatorv1.Installatio
 	if instance.CertificateManagement != nil {
 		numInitContainers++
 	}
-	// FlexVolume adds an additional FlexVolume init container.
+	// The FlexVolume driver cleanup is always present.
 	numInitContainers++
 	Expect(ds.Spec.Template.Spec.InitContainers).To(HaveLen(numInitContainers))
 
@@ -3384,9 +3393,7 @@ func verifyInitContainers(ds *appsv1.DaemonSet, instance *operatorv1.Installatio
 	flexvolContainer := rtest.GetContainer(ds.Spec.Template.Spec.InitContainers, "flexvol-driver")
 	Expect(flexvolContainer).NotTo(BeNil())
 	Expect(flexvolContainer.Image).To(Equal(fmt.Sprintf("quay.io/%s%s:%s", components.CalicoImagePath, components.ComponentCalico.Image, components.ComponentCalico.Version)))
-	if instance.FlexVolumePath != "None" {
-		Expect(flexvolContainer.Command).To(Equal([]string{"/usr/bin/calico", "component", "flexvol", "install", "--target", "/host/driver/uds"}))
-	}
+	Expect(flexvolContainer.Command[:4]).To(Equal([]string{"/usr/bin/calico", "component", "flexvol", "uninstall"}))
 
 	Expect(*flexvolContainer.SecurityContext.AllowPrivilegeEscalation).To(BeTrue())
 	Expect(*flexvolContainer.SecurityContext.Privileged).To(BeTrue())

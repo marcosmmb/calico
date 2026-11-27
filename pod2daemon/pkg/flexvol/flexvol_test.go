@@ -15,229 +15,161 @@
 package flexvol
 
 import (
-	"bytes"
+	"errors"
+	"io/fs"
 	"os"
 	"path/filepath"
+	"reflect"
+	"strings"
 	"testing"
 )
 
-func TestInstallDriverCopiesRunningBinary(t *testing.T) {
-	dst := filepath.Join(t.TempDir(), "uds")
-
-	if err := installDriver(dst); err != nil {
-		t.Fatalf("installDriver: %v", err)
-	}
-
-	// Destination must be byte-identical to the source so argv[0]
-	// dispatch routes kubelet's "uds <args>" into the same binary.
-	src, err := os.Executable()
-	if err != nil {
-		t.Fatalf("os.Executable: %v", err)
-	}
-	srcBytes, err := os.ReadFile(src)
-	if err != nil {
-		t.Fatalf("read src: %v", err)
-	}
-	dstBytes, err := os.ReadFile(dst)
-	if err != nil {
-		t.Fatalf("read dst: %v", err)
-	}
-	if !bytes.Equal(srcBytes, dstBytes) {
-		t.Fatalf("dst (%d bytes) does not match src (%d bytes)", len(dstBytes), len(srcBytes))
-	}
-
-	info, err := os.Stat(dst)
-	if err != nil {
-		t.Fatalf("stat dst: %v", err)
-	}
-	if mode := info.Mode().Perm(); mode != 0o550 {
-		t.Errorf("dst permissions = %#o, want 0550", mode)
-	}
-}
-
-func TestInstallDriverRequiresTarget(t *testing.T) {
-	if err := installDriver(""); err == nil {
-		t.Fatal("expected error when target is empty")
-	}
-}
-
-func TestInstallDriverRejectsNonUdsBasename(t *testing.T) {
-	dst := filepath.Join(t.TempDir(), "policysync")
-	if err := installDriver(dst); err == nil {
-		t.Fatal("expected error when target basename is not \"uds\"")
-	}
-}
-
-func TestInstallDriverOverwritesExistingFile(t *testing.T) {
-	dst := filepath.Join(t.TempDir(), "uds")
-	if err := os.WriteFile(dst, []byte("stale"), 0o644); err != nil {
-		t.Fatalf("seed dst: %v", err)
-	}
-
-	if err := installDriver(dst); err != nil {
-		t.Fatalf("installDriver: %v", err)
-	}
-
-	got, err := os.ReadFile(dst)
-	if err != nil {
-		t.Fatalf("read dst: %v", err)
-	}
-	if bytes.Equal(got, []byte("stale")) {
-		t.Fatal("install did not overwrite existing file")
-	}
-}
-
-func TestInstallDriverIfPresentSkipsMissingDriver(t *testing.T) {
-	root := t.TempDir()
-	if err := installDriverIfPresent(filepath.Join(root, "nodeagent~uds", "uds")); err != nil {
-		t.Fatalf("installDriverIfPresent: %v", err)
-	}
-	entries, err := os.ReadDir(root)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(entries) != 0 {
-		t.Fatalf("expected nothing created, got %v", entries)
-	}
-}
-
-func TestInstallDriverIfPresentReplacesInstalledDriver(t *testing.T) {
-	dst := filepath.Join(t.TempDir(), "uds")
-	if err := os.WriteFile(dst, []byte("old"), 0o550); err != nil {
-		t.Fatal(err)
-	}
-	if err := installDriverIfPresent(dst); err != nil {
-		t.Fatalf("installDriverIfPresent: %v", err)
-	}
-	got, err := os.ReadFile(dst)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if bytes.Equal(got, []byte("old")) {
-		t.Fatal("installed driver was not replaced")
-	}
-}
-
 const (
-	testUID      = "20154c76-bf4e-11e7-8a7e-080027631ab3"
-	testOtherUID = "2dc75e9a-cbec-11e7-b158-0800270da466"
+	idleMountInfo = `22 1 8:1 / / rw,relatime shared:1 - ext4 /dev/sda1 rw
+300 22 0:50 / /var/lib/kubelet/pods/11111111-2222-3333-4444-555555555555/volumes/kubernetes.io~projected/kube-api-access rw,relatime shared:90 - tmpfs tmpfs rw
+301 22 0:51 / /var/lib/kubelet/pods/11111111-2222-3333-4444-555555555555/volumes/kubernetes.io~csi/policysync/mount rw,relatime shared:91 - tmpfs tmpfs rw
+`
+	inUseMountInfo = idleMountInfo +
+		`310 22 0:60 / /var/lib/kubelet/pods/aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee/volumes/nodeagent~uds/policysync rw,relatime shared:95 - tmpfs tmpfs rw,size=8k
+311 310 0:25 /nodeagent/mount/aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee /var/lib/kubelet/pods/aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee/volumes/nodeagent~uds/policysync/nodeagent rw,nosuid shared:5 - tmpfs tmpfs rw
+`
 )
 
-func volumeDir(root, uid string) string {
-	return root + "/pods/" + uid + "/volumes/nodeagent~uds/test-volume"
-}
-
-func TestCheckValidMountOptsAcceptsKubeletOptions(t *testing.T) {
-	for _, uid := range []string{testUID, "0c6d6e1d9b3c4c2e8f0a1b2c3d4e5f60"} {
-		opts := `{"kubernetes.io/pod.uid":"` + uid + `","kubernetes.io/pod.name":"p","kubernetes.io/pod.namespace":"ns","kubernetes.io/serviceAccount.name":"sa"}`
-		c, path, ok := checkValidMountOpts(volumeDir("/var/lib/kubelet", uid), opts)
-		if !ok {
-			t.Fatalf("uid %q: expected valid opts", uid)
-		}
-		if path != uid || c.UID != uid || c.Workload != "p" || c.Namespace != "ns" || c.ServiceAccount != "sa" {
-			t.Errorf("uid %q: unexpected result path=%q creds=%+v", uid, path, c)
+// installedDriver creates a plugin directory holding the driver as an earlier
+// release would have left it, and returns the driver directory.
+func installedDriver(t *testing.T) string {
+	t.Helper()
+	dir := filepath.Join(t.TempDir(), driverDirName)
+	if err := os.Mkdir(dir, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	for _, name := range []string{driverBinary, tmpBinaryPrefix + "123456"} {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte("driver"), 0o550); err != nil {
+			t.Fatalf("write %s: %v", name, err)
 		}
 	}
+	return dir
 }
 
-func TestCheckValidMountOptsRejectsUIDNotMatchingDir(t *testing.T) {
-	for _, uid := range []string{"", "x", testOtherUID} {
-		opts := `{"kubernetes.io/pod.uid":"` + uid + `"}`
-		if _, _, ok := checkValidMountOpts(volumeDir("/var/lib/kubelet", testUID), opts); ok {
-			t.Errorf("uid %q: expected rejection", uid)
-		}
+func writeMountInfo(t *testing.T, content string) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "mountinfo")
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		t.Fatalf("write mountinfo: %v", err)
+	}
+	return path
+}
+
+func TestUninstallDriverRemovesDriverDir(t *testing.T) {
+	dir := installedDriver(t)
+
+	if err := uninstallDriver(dir, writeMountInfo(t, idleMountInfo)); err != nil {
+		t.Fatalf("uninstallDriver: %v", err)
+	}
+	if _, err := os.Lstat(dir); !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("driver dir still present, lstat err = %v", err)
 	}
 }
 
-func TestCheckValidMountOptsUsesExactKeys(t *testing.T) {
-	opts := `{"kubernetes.io/pod.uid":"` + testUID + `",` +
-		`"kubernetes.io/pod.name":"p","kubernetes.io/pod.namespace":"ns","kubernetes.io/serviceAccount.name":"sa",` +
-		`"Kubernetes.io/pod.uid":"` + testOtherUID + `",` +
-		`"Kubernetes.io/pod.name":"other","Kubernetes.io/pod.namespace":"other","Kubernetes.io/serviceAccount.name":"other"}`
-	c, path, ok := checkValidMountOpts(volumeDir("/var/lib/kubelet", testUID), opts)
-	if !ok {
-		t.Fatal("expected valid opts")
+func TestUninstallDriverLeavesDriverWhileMounted(t *testing.T) {
+	dir := installedDriver(t)
+
+	if err := uninstallDriver(dir, writeMountInfo(t, inUseMountInfo)); err != nil {
+		t.Fatalf("uninstallDriver: %v", err)
 	}
-	if path != testUID || c.Workload != "p" || c.Namespace != "ns" || c.ServiceAccount != "sa" {
-		t.Errorf("non-exact keys used: path=%q creds=%+v", path, c)
+	if _, err := os.Stat(filepath.Join(dir, driverBinary)); err != nil {
+		t.Fatalf("driver was removed while a pod still mounts it: %v", err)
 	}
 }
 
-func TestPodUIDFromDir(t *testing.T) {
-	for _, root := range []string{
-		"/var/lib/kubelet",
-		"/var/snap/microk8s/common/var/lib/kubelet",
-		"/var/lib/k0s/kubelet",
-		"/data/custom-kubelet",
+func TestUninstallDriverMissingDriverIsNoOp(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), driverDirName)
+
+	if err := uninstallDriver(dir, writeMountInfo(t, idleMountInfo)); err != nil {
+		t.Fatalf("uninstallDriver: %v", err)
+	}
+}
+
+func TestUninstallDriverKeepsForeignFiles(t *testing.T) {
+	dir := installedDriver(t)
+	foreign := filepath.Join(dir, "other")
+	if err := os.WriteFile(foreign, []byte("x"), 0o644); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+
+	if err := uninstallDriver(dir, writeMountInfo(t, idleMountInfo)); err != nil {
+		t.Fatalf("uninstallDriver: %v", err)
+	}
+	if _, err := os.Stat(foreign); err != nil {
+		t.Fatalf("foreign file was removed: %v", err)
+	}
+	if _, err := os.Lstat(filepath.Join(dir, driverBinary)); !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("driver still present, lstat err = %v", err)
+	}
+}
+
+func TestUninstallDriverRejectsBadArguments(t *testing.T) {
+	mountInfo := writeMountInfo(t, idleMountInfo)
+	for name, tc := range map[string]struct{ target, mountInfo string }{
+		"empty target":        {"", mountInfo},
+		"empty mountinfo":     {filepath.Join(t.TempDir(), driverDirName), ""},
+		"unexpected basename": {t.TempDir(), mountInfo},
 	} {
-		for _, dir := range []string{volumeDir(root, testUID), volumeDir(root, testUID) + "/"} {
-			if uid, err := podUIDFromDir(dir); err != nil || uid != testUID {
-				t.Errorf("podUIDFromDir(%q) = %q, %v", dir, uid, err)
+		t.Run(name, func(t *testing.T) {
+			if err := uninstallDriver(tc.target, tc.mountInfo); err == nil {
+				t.Fatal("expected an error")
 			}
-		}
-	}
-
-	for _, dir := range []string{
-		"",
-		"/",
-		"/var/lib/kubelet/pods/" + testUID,
-		"/var/lib/kubelet/pods/" + testUID + "/volumes/other~driver/test-volume",
-		"/var/lib/kubelet/notpods/" + testUID + "/volumes/nodeagent~uds/test-volume",
-		volumeDir("/var/lib/kubelet", ".."),
-		volumeDir("/var/lib/kubelet", "------------------------------------"),
-		volumeDir("/var/lib/kubelet", "0c6d6e1d9b3c4c2e8f0a1b2c3d4e5f6"),
-	} {
-		if uid, err := podUIDFromDir(dir); err == nil {
-			t.Errorf("podUIDFromDir(%q) = %q, expected error", dir, uid)
-		}
+		})
 	}
 }
 
-func TestUnmountCleansUpUnderAnyKubeletRoot(t *testing.T) {
-	useTempConfiguration(t)
-	for _, root := range []string{"/var/lib/kubelet", "/var/snap/microk8s/common/var/lib/kubelet", "/var/lib/k0s/kubelet"} {
-		workloadDir := filepath.Join(configuration.NodeAgentWorkloadHomeDir, testUID)
-		credsFile := filepath.Join(configuration.NodeAgentCredentialsHomeDir, testUID+".json")
-		if err := os.MkdirAll(workloadDir, 0o755); err != nil {
-			t.Fatal(err)
-		}
-		if err := os.WriteFile(credsFile, []byte("{}"), 0o644); err != nil {
-			t.Fatal(err)
-		}
+func TestUninstallDriverRefusesSymlink(t *testing.T) {
+	real := t.TempDir()
+	victim := filepath.Join(real, driverBinary)
+	if err := os.WriteFile(victim, []byte("x"), 0o644); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	link := filepath.Join(t.TempDir(), driverDirName)
+	if err := os.Symlink(real, link); err != nil {
+		t.Fatalf("symlink: %v", err)
+	}
 
-		if err := unmount(volumeDir(root, testUID)); err != nil {
-			t.Fatalf("root %q: unmount: %v", root, err)
-		}
-		for _, p := range []string{workloadDir, credsFile} {
-			if _, err := os.Stat(p); !os.IsNotExist(err) {
-				t.Errorf("root %q: %s not removed", root, p)
-			}
-		}
+	if err := uninstallDriver(link, writeMountInfo(t, idleMountInfo)); err == nil {
+		t.Fatal("expected an error for a symlinked driver dir")
+	}
+	if _, err := os.Stat(victim); err != nil {
+		t.Fatalf("file behind the symlink was removed: %v", err)
 	}
 }
 
-func useTempConfiguration(t *testing.T) {
-	home := t.TempDir()
-	prev := configuration
-	configuration = &ConfigurationOptions{
-		NodeAgentManagementHomeDir:  home,
-		NodeAgentWorkloadHomeDir:    filepath.Join(home, "mount"),
-		NodeAgentCredentialsHomeDir: filepath.Join(home, "creds"),
-		LogLevel:                    LOG_LEVEL_WARN,
+// Without a readable mount table there is no way to tell whether the driver is
+// in use, so it must be left alone.
+func TestUninstallDriverUnreadableMountInfoKeepsDriver(t *testing.T) {
+	dir := installedDriver(t)
+
+	if err := uninstallDriver(dir, filepath.Join(t.TempDir(), "missing")); err == nil {
+		t.Fatal("expected an error when mountinfo cannot be read")
 	}
-	if err := os.MkdirAll(configuration.NodeAgentCredentialsHomeDir, 0o755); err != nil {
-		t.Fatal(err)
+	if _, err := os.Stat(filepath.Join(dir, driverBinary)); err != nil {
+		t.Fatalf("driver was removed without a mount check: %v", err)
 	}
-	t.Cleanup(func() { configuration = prev })
 }
 
-func TestPathUnder(t *testing.T) {
-	if p, err := pathUnder("/var/run/nodeagent/mount", "abc"); err != nil || p != "/var/run/nodeagent/mount/abc" {
-		t.Errorf("pathUnder valid: got %q, %v", p, err)
+func TestParseDriverMounts(t *testing.T) {
+	got, err := parseDriverMounts(strings.NewReader(inUseMountInfo))
+	if err != nil {
+		t.Fatalf("parseDriverMounts: %v", err)
 	}
-	for _, elem := range []string{"", ".", "..", "../x", "a/b", "/etc"} {
-		if _, err := pathUnder("/var/run/nodeagent/mount", elem); err == nil {
-			t.Errorf("pathUnder(%q): expected error", elem)
-		}
+	want := []string{"/var/lib/kubelet/pods/aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee/volumes/nodeagent~uds/policysync"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("mounts = %v, want %v", got, want)
+	}
+
+	got, err = parseDriverMounts(strings.NewReader(idleMountInfo))
+	if err != nil {
+		t.Fatalf("parseDriverMounts: %v", err)
+	}
+	if len(got) != 0 {
+		t.Fatalf("mounts = %v, want none", got)
 	}
 }

@@ -12,7 +12,7 @@ Architecture: `DESIGN.md` at the repository root, the per-component `DESIGN.md` 
 | Traffic from outside the node | untrusted | any packet arriving on host interfaces, NodePorts, load balancer IPs, tunnels |
 | Namespace-scoped Kubernetes users | partly trusted | pods, Services, labels and annotations in their namespaces; namespaced Calico `NetworkPolicy` and Kubernetes `NetworkPolicy`, in the tiers RBAC allows them |
 | Cluster admins | trusted | cluster-scoped Calico resources (`GlobalNetworkPolicy`, `Tier`, `IPPool`, `FelixConfiguration`, `BGPConfiguration`, `BGPPeer`, `BGPFilter`), `operator.tigera.io` resources, direct etcd access |
-| Root on a node, the kubelet, the container runtime | trusted | CNI, flexvol and CSI invocations, files on the host |
+| Root on a node, the kubelet, the container runtime | trusted | CNI and CSI invocations, files on the host |
 | Calico components talking to each other | trusted once authenticated | Felix ↔ Typha, Felix → Goldmane, whisker-backend → Goldmane, Guardian |
 
 A namespace user must not be able to affect traffic, IP assignment, routing or policy outside their own namespaces, or read another tenant's data, beyond what their RBAC allows.
@@ -26,7 +26,7 @@ A namespace user must not be able to affect traffic, IP assignment, routing or p
 5. **Certificates and component identity.** Operator CSR signer (`operator/pkg/controller/csr/`), `key-cert-provisioner/`, TLS setup in `crypto/pkg/tls/` and `typha/pkg/tlsutils/`. A pod obtaining a certificate for a Calico component identity, or a peer passing mTLS it should fail, undermines every internal channel.
 6. **CNI plugin and IPAM** (`cni-plugin/pkg/`, `libcalico-go/lib/ipam/`). Run as root on the host, driven by the kubelet and by `cni.projectcalico.org/*` annotations that namespace users set. Also load balancer IP assignment from Service annotations (`kube-controllers/pkg/controllers/loadbalancer/`) and label sync in `kube-controllers/`. Taking another workload's IP, or an IP outside what the namespace may use, affects policy identity and traffic.
 7. **L7 policy** (`app-policy/checker/`). Calico's own HTTP path normalization and matching for Envoy ext_authz. A path that normalizes differently here than in the application is a policy bypass.
-8. **Node agents driven by the kubelet** (`pod2daemon/`): the flexvol driver, CSI driver and per-pod credential sockets. They run as root and write under host paths.
+8. **Node agents driven by the kubelet** (`pod2daemon/`): the CSI driver and per-pod credential sockets, and removal of the flexvol driver that earlier releases installed. They run as root and write under host paths.
 9. **Guardian** (`guardian/pkg/`). Reverse proxy from a management-cluster tunnel into the Kubernetes API and Goldmane, using Guardian's own credentials. Path or target confusion that widens what the tunnel can reach matters.
 10. **Lower priority:** Typha's sync protocol (`typha/pkg/syncserver/`); Goldmane, whisker-backend and the whisker UI (flow data includes names and labels chosen by namespace users); confd templates that render datastore fields into BIRD config (`confd/`, `node/filesystem/etc/calico/confd/templates/`); node startup (`node/pkg/`); `calicoctl`.
 
